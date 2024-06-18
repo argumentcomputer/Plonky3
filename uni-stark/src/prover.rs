@@ -19,6 +19,7 @@ use crate::{
     StarkGenericConfig, Val,
 };
 
+#[allow(clippy::multiple_bound_locations)]
 #[instrument(skip_all)]
 #[allow(clippy::multiple_bound_locations)]
 pub fn prove<

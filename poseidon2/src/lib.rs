@@ -21,7 +21,10 @@ use rand::distributions::{Distribution, Standard};
 use rand::Rng;
 pub use round_numbers::poseidon2_round_numbers_128;
 
-const SUPPORTED_WIDTHS: [usize; 8] = [2, 3, 4, 8, 12, 16, 20, 24];
+/// Only support WIDTH parameters of 2, 3, or multiples of 4.
+const fn supported_width<const WIDTH: usize>() -> bool {
+    WIDTH == 2 || WIDTH == 3 || (WIDTH != 0 && WIDTH % 4 == 0)
+}
 
 /// The Poseidon2 permutation.
 #[derive(Clone, Debug)]
@@ -60,7 +63,7 @@ where
         internal_constants: Vec<F>,
         internal_linear_layer: Diffusion,
     ) -> Self {
-        assert!(SUPPORTED_WIDTHS.contains(&WIDTH));
+        assert!(supported_width::<WIDTH>());
         Self {
             rounds_f,
             external_constants,
