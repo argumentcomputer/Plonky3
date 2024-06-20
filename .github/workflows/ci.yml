@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "dev", "sp1-new" ]
   pull_request:
     branches: [ "*" ]
 
@@ -10,119 +10,106 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 1
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
-  build_and_test:
-    name: Build and Test
+  test:
+    # Change to warp-ubuntu-latest-x64-16x for a more powerful runner
     runs-on: ubuntu-latest
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
-
     steps:
-    - uses: actions/checkout@v4
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
+      - uses: actions/checkout@v4
+        with:
+          repository: lurk-lab/ci-workflows
+      - uses: ./.github/actions/ci-env
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux Tests
+        run: |
+          cargo nextest run --profile ci --workspace
+      - name: Linux Tests with the parallel feeature
+        run: |
+          cargo nextest run --profile ci --workspace --features parallel
 
-    - uses: dtolnay/rust-toolchain@stable
-      id: rs-stable
-
-    - uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: rust-${{ steps.rs-stable.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.toml') }}
-
-    - name: Build
-      run: cargo build --verbose --all-targets
-
-    - name: Check with parallel
-      run: cargo check --verbose --all-targets --features parallel
-
-    - name: Test
-      run: cargo test --verbose
-
-    - name: Test with parallel
-      run: cargo test --verbose --features parallel
-
-  lint:
-    name: Formatting and Clippy
+  clippy:
     runs-on: ubuntu-latest
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
-
     steps:
-    - uses: actions/checkout@v4
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
+      - uses: actions/checkout@v4
+        with:
+          repository: lurk-lab/ci-workflows
+      - uses: ./.github/actions/ci-env
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Rustfmt Code Style
+        run: cargo fmt --all --check
+      - name: check *everything* compiles
+        run: cargo check --all-targets --all-features --workspace --examples --tests --benches
+      # See '.cargo/config' for list of enabled/disabled clippy lints
+      - name: Check clippy warnings
+        run: cargo xclippy -D warnings
+      - name: Doctests
+        run: cargo test --doc --workspace
 
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-          components: clippy
-      id: rs-stable
-
-    - uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: rustfmt
-
-    - uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: rust-${{ steps.rs-stable.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.toml') }}
-
-    - name: Clippy
-      run: cargo +stable clippy --all-targets -- -D warnings
-
-    - name: Format
-      run: cargo +nightly fmt --all -- --check 
-
-  check_crates:
-    name: Check Crates
-    runs-on: ubuntu-latest
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
-
+  # On a push or pull request to `sp1-new`, check downstream crates compile, i.e.
+  # lurk-lab/sphinx and lurk-lab/zk-light-clients
+  check-downstream-compiles:
+    runs-on: warp-ubuntu-latest-x64-16x
+    if: ${{ github.base_ref == 'sp1-new' || github.ref_name == 'sp1-new' }}
     steps:
-    - uses: actions/checkout@v4
-
-    - uses: dtolnay/rust-toolchain@stable
-      id: rs-stable
-
-    - uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: rust-${{ steps.rs-stable.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
-  
-    - name: Cargo Check Crates
-      run: |
-        cargo check --verbose --package p3-air
-        cargo check --verbose --package p3-baby-bear
-        cargo check --verbose --package p3-blake3
-        cargo check --verbose --package p3-challenger
-        cargo check --verbose --package p3-commit
-        cargo check --verbose --package p3-dft
-        cargo check --verbose --package p3-field
-        cargo check --verbose --package p3-field-testing
-        cargo check --verbose --package p3-fri
-        cargo check --verbose --package p3-goldilocks
-        cargo check --verbose --package p3-interpolation
-        cargo check --verbose --package p3-keccak
-        cargo check --verbose --package p3-keccak-air
-        cargo check --verbose --package p3-lde
-        cargo check --verbose --package p3-matrix
-        cargo check --verbose --package p3-maybe-rayon
-        cargo check --verbose --package p3-mds
-        cargo check --verbose --package p3-merkle-tree
-        cargo check --verbose --package p3-mersenne-31
-        cargo check --verbose --package p3-monolith
-        cargo check --verbose --package p3-poseidon
-        cargo check --verbose --package p3-poseidon2
-        cargo check --verbose --package p3-rescue
-        cargo check --verbose --package p3-symmetric
-        cargo check --verbose --package p3-uni-stark
-        cargo check --verbose --package p3-util
+      - name: Set up git private repo access
+        run: |
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
+          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
+      - uses: actions/checkout@v4
+        with:
+          repository: lurk-lab/ci-workflows
+          path: ci-workflows
+      - uses: ./ci-workflows/.github/actions/ci-env
+      - name: Set env
+        run: |
+          echo "UPSTREAM_REPO=$(echo "lurk-lab/Plonky3" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
+          echo "DOWNSTREAM_REPO=$(echo "lurk-lab/sphinx" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
+          echo "DOWNSTREAM_REPO_2=$(echo "lurk-lab/zk-light-clients" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.UPSTREAM_REPO }}
+      - uses: actions/checkout@v4
+        with:
+          repository: "lurk-lab/${{ env.DOWNSTREAM_REPO }}"
+          path: ${{ github.workspace }}/${{ env.DOWNSTREAM_REPO }}
+          token: ${{ secrets.REPO_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          repository: "lurk-lab/${{ env.DOWNSTREAM_REPO_2 }}"
+          path: ${{ github.workspace }}/${{ env.DOWNSTREAM_REPO_2 }}
+          token: ${{ secrets.REPO_TOKEN }}
+      - name: Setup CI
+        uses: ./sphinx/.github/actions/setup
+        with:
+          pull_token: ${{ secrets.REPO_TOKEN }}
+          perf: false
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev cmake
+          cd sphinx/cli
+          cargo install --locked --force --path .
+          cargo prove install-toolchain
+          echo "RUSTFLAGS=${{env.RUSTFLAGS}} --cfg tokio_unstable" | tee -a $GITHUB_ENV
+      - uses: ./ci-workflows/.github/actions/check-downstream-compiles
+        with:
+          upstream-path: "${{ env.UPSTREAM_REPO }}"
+          downstream-path: "${{ env.DOWNSTREAM_REPO }}"
+          more-paths: "${{ env.DOWNSTREAM_REPO_2 }}/aptos"
+          patch-ssh: false
