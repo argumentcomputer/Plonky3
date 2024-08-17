@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "dev", "sp1-new" ]
+    branches: [ "main", "dev", "sp1-new", "sp1" ]
   pull_request:
-    branches: [ "*" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,13 +18,9 @@ jobs:
     # Change to warp-ubuntu-latest-x64-16x for a more powerful runner
     runs-on: ubuntu-latest
     steps:
-      - name: Set up git private repo access
-        run: |
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
       - uses: actions/checkout@v4
         with:
-          repository: lurk-lab/ci-workflows
+          repository: argumentcomputer/ci-workflows
       - uses: ./.github/actions/ci-env
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,13 +36,9 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - name: Set up git private repo access
-        run: |
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
       - uses: actions/checkout@v4
         with:
-          repository: lurk-lab/ci-workflows
+          repository: argumentcomputer/ci-workflows
       - uses: ./.github/actions/ci-env
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,54 +53,34 @@ jobs:
       - name: Doctests
         run: cargo test --doc --workspace
 
-  # On a push or pull request to `sp1-new`, check downstream crates compile, i.e.
-  # lurk-lab/sphinx and lurk-lab/zk-light-clients
+  # On a push or pull request to `sp1-new` or `sp1`, check downstream crates compile
   check-downstream-compiles:
     runs-on: warp-ubuntu-latest-x64-16x
-    if: ${{ github.base_ref == 'sp1-new' || github.ref_name == 'sp1-new' }}
+    if: ${{ github.base_ref == 'sp1-new' || github.ref_name == 'sp1-new' || github.base_ref == 'sp1' || github.ref_name == 'sp1' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: sphinx
+          - repo: loam
     steps:
-      - name: Set up git private repo access
-        run: |
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com/".insteadOf ssh://git@github.com
-          git config --global url."https://${{ secrets.REPO_TOKEN }}@github.com".insteadOf https://github.com
       - uses: actions/checkout@v4
         with:
-          repository: lurk-lab/ci-workflows
+          repository: argumentcomputer/ci-workflows
           path: ci-workflows
       - uses: ./ci-workflows/.github/actions/ci-env
-      - name: Set env
-        run: |
-          echo "UPSTREAM_REPO=$(echo "lurk-lab/Plonky3" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
-          echo "DOWNSTREAM_REPO=$(echo "lurk-lab/sphinx" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
-          echo "DOWNSTREAM_REPO_2=$(echo "lurk-lab/zk-light-clients" | awk -F'/' '{ print $2 }')" | tee -a $GITHUB_ENV
       - uses: actions/checkout@v4
         with:
-          path: ${{ github.workspace }}/${{ env.UPSTREAM_REPO }}
+          path: ${{ github.workspace }}/Plonky3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v4
         with:
-          repository: "lurk-lab/${{ env.DOWNSTREAM_REPO }}"
-          path: ${{ github.workspace }}/${{ env.DOWNSTREAM_REPO }}
+          repository: argumentcomputer/${{ matrix.repo }}
+          path: ${{ github.workspace }}/${{ matrix.repo }}
           token: ${{ secrets.REPO_TOKEN }}
-      - uses: actions/checkout@v4
-        with:
-          repository: "lurk-lab/${{ env.DOWNSTREAM_REPO_2 }}"
-          path: ${{ github.workspace }}/${{ env.DOWNSTREAM_REPO_2 }}
-          token: ${{ secrets.REPO_TOKEN }}
-      - name: Setup CI
-        uses: ./sphinx/.github/actions/setup
-        with:
-          pull_token: ${{ secrets.REPO_TOKEN }}
-          perf: false
-      - name: Install deps
-        run: |
-          sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev cmake
-          cd sphinx/cli
-          cargo install --locked --force --path .
-          cargo prove install-toolchain
-          echo "RUSTFLAGS=${{env.RUSTFLAGS}} --cfg tokio_unstable" | tee -a $GITHUB_ENV
       - uses: ./ci-workflows/.github/actions/check-downstream-compiles
         with:
-          upstream-path: "${{ env.UPSTREAM_REPO }}"
-          downstream-path: "${{ env.DOWNSTREAM_REPO }}"
-          more-paths: "${{ env.DOWNSTREAM_REPO_2 }}/aptos"
-          patch-ssh: false
+          upstream-path: "Plonky3"
+          downstream-path: "${{ matrix.repo }}"
+          features: "${{ matrix.features }}"
