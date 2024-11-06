@@ -16,3 +16,4 @@ p3-util = { path = "../util" }
 itertools = "0.13.0"
 tracing = "0.1.37"
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+thiserror = "1.0.65"
