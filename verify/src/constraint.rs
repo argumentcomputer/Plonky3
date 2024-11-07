@@ -1,4 +1,4 @@
-use crate::constraint::node::{Node, ProcessedNodes};
+use crate::constraint::node::{Node, NodesInfo};
 use crate::constraint::zerofier::ZerofierExpression;
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_matrix::Dimensions;
@@ -10,21 +10,22 @@ pub mod node;
 mod raw_metadata;
 pub mod zerofier;
 
+pub type VariableGroupInfo = Vec<usize>;
+
 struct Expression {
     node_id: usize,
     zerofier_id: Option<usize>,
 }
 
 pub struct MachineMetadata<F: Field, EF: ExtensionField<F>> {
-    num_global_variables: Vec<usize>,
+    num_global_variables: VariableGroupInfo,
     chips: Vec<ChipMetadata<F, EF>>,
     nodes: Vec<Node<F>>,
     constraints: Vec<Expression>,
 }
 
 pub struct ChipMetadata<F: Field, EF: ExtensionField<F>> {
-    num_local_variables: Vec<usize>,
-    num_global_variables: Vec<usize>,
+    num_local_variables: VariableGroupInfo,
     trace_window_dimensions: Vec<Dimensions>,
     periodic: Vec<Vec<F>>,
     zerofiers: Vec<ZerofierExpression<F>>,
@@ -52,6 +53,10 @@ impl<F: Field, EF: ExtensionField<F>> ChipMetadata<F, EF> {
         // But we pad it to a power of two so that we can efficiently decompose the quotient.
         (max_constraints_degree - 1).next_power_of_two()
     }
+
+    fn node_info(&self) -> NodesInfo<'_, F, EF> {
+        NodesInfo::new_unchecked(&self.nodes)
+    }
 }
 
 pub struct ChipData<'a, F: Field, EF: ExtensionField<F>> {
@@ -72,11 +77,7 @@ impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
         log_height: usize,
     ) -> Result<Self, ()> {
         // Check length of local variables
-        if chip.num_local_variables.len() != local_variables.len() {
-            return Err(());
-        }
-        if zip(&chip.num_local_variables, &local_variables)
-            .any(|(num_vars, vars)| vars.len() != *num_vars)
+        if zip(&chip.num_local_variables, &local_variables).any(|(size, vars)| vars.len() != *size)
         {
             return Err(());
         }
@@ -85,6 +86,8 @@ impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
         if chip.trace_window_dimensions.len() != trace_evals.len() {
             return Err(());
         }
+
+        // Check size of trace evaluations
         for (dim, segment_rows) in zip(&chip.trace_window_dimensions, &trace_evals) {
             if segment_rows.len() != dim.height {
                 return Err(());
@@ -94,6 +97,7 @@ impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
             }
         }
 
+        //
         let num_quotient_evals = chip.num_quotient_evals();
         if quotient_evals.len() != num_quotient_evals * EF::D {
             return Err(());
@@ -160,13 +164,7 @@ impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
         let quotient_expected = self
             .quotient_evals
             .chunks_exact(EF::D)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(e_i, base_i)| EF::monomial(e_i) * *base_i)
-                    .sum::<EF>()
-            })
+            .map(unflatten_extension)
             .rev()
             .fold(EF::zero(), |acc, eval| acc * zeta_pow_n + eval);
 
@@ -176,4 +174,13 @@ impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
 
         Ok(())
     }
+}
+
+fn unflatten_extension<F: Field, EF: ExtensionField<F>>(bases: &[EF]) -> EF {
+    assert_eq!(bases.len(), EF::D);
+    bases
+        .iter()
+        .enumerate()
+        .map(|(e_i, base_i)| EF::monomial(e_i) * *base_i)
+        .sum()
 }

@@ -1,9 +1,11 @@
+use crate::constraint::{unflatten_extension, VariableGroupInfo};
+use core::slice;
 use p3_field::{ExtensionField, Field};
 use p3_matrix::Dimensions;
 use std::cmp;
 use std::marker::PhantomData;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VarScope {
     /// Refer to a shared variable (public value, challenge, ...)
     Global,
@@ -16,6 +18,14 @@ enum VarScope {
 enum FieldType {
     Base,
     Ext,
+}
+
+pub enum NodeError {
+    InvalidReference(usize),
+    SharedVariableAccess,
+    Variable(usize),
+    Trace(usize),
+    Periodic(usize),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -54,115 +64,162 @@ pub enum Node<F: Field> {
     },
 }
 
-pub struct ProcessedNodes<F: Field, EF: ExtensionField<F>> {
-    pub nodes: Vec<Node<F>>,
-    pub counted_local_variables: Vec<Vec<usize>>,
-    pub counted_global_variables: Vec<usize>,
-    pub counted_periodic_columns: usize,
-    pub trace_window_dimensions: Vec<Dimensions>,
-    pub degrees: Vec<usize>,
+pub struct NodesInfo<'a, F: Field, EF: ExtensionField<F>> {
+    nodes: &'a [Node<F>],
     _marker: PhantomData<EF>,
 }
 
-impl<F: Field, EF: ExtensionField<F>> TryFrom<Vec<Node<F>>> for ProcessedNodes<F, EF> {
-    type Error = ();
-
-    fn try_from(nodes: Vec<Node<F>>) -> Result<Self, Self::Error> {
-        let mut counted_local_variables = vec![vec![]];
-        let mut counted_global_variables = vec![];
-        let mut counted_periodic_columns = 0;
-        let mut trace_window_dimensions = vec![];
-        let mut degrees = Vec::with_capacity(nodes.len());
-
-        for node in &nodes {
-            let degree = match node {
-                Node::Constant(_) => 0,
-                Node::Trace {
-                    segment,
-                    col_offset,
-                    row_offset,
-                    field_type,
-                } => {
-                    let min_segments = segment + 1;
-                    trace_window_dimensions.resize(
-                        min_segments,
-                        Dimensions {
-                            width: 0,
-                            height: 0,
-                        },
-                    );
-
-                    let dim = &mut trace_window_dimensions[*segment];
-
-                    let min_width = match field_type {
-                        FieldType::Base => col_offset + 1,
-                        FieldType::Ext => col_offset + EF::D,
-                    };
-                    let min_height = row_offset + 1;
-                    dim.width = cmp::max(dim.width, min_width);
-                    dim.height = cmp::max(dim.height, min_height);
-
-                    1
+impl<'a, F: Field, EF: ExtensionField<F>> NodesInfo<'a, F, EF> {
+    pub fn new(nodes: &'a [Node<F>]) -> Result<Self, NodeError> {
+        for (node_id, node) in nodes.iter().enumerate() {
+            match node {
+                Node::Add { lhs_id, rhs_id }
+                | Node::Sub { lhs_id, rhs_id }
+                | Node::Mul { lhs_id, rhs_id } => {
+                    if *lhs_id >= node_id || *rhs_id >= node_id {
+                        return Err(NodeError::InvalidReference(node_id));
+                    }
                 }
-                Node::Var {
-                    scope,
-                    group,
-                    offset,
-                    field_type,
-                } => {
-                    let variable_group = match scope {
-                        VarScope::Global => &mut counted_global_variables,
-                        VarScope::Local { chip_id } => {
-                            counted_local_variables.resize(chip_id + 1, vec![]);
-                            &mut counted_local_variables[*chip_id]
-                        }
-                    };
-                    let min_width = match field_type {
-                        FieldType::Base => offset + 1,
-                        FieldType::Ext => offset + EF::D,
-                    };
-                    variable_group[*group] = cmp::max(variable_group[*group], min_width);
+                _ => {}
+            }
+        }
+        Ok(Self::new_unchecked(nodes))
+    }
 
-                    0
+    pub fn new_unchecked(nodes: &'a [Node<F>]) -> Self {
+        Self {
+            nodes,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn validate_shared_variables(
+        &self,
+        num_shared_vars: &[&VariableGroupInfo],
+    ) -> Result<(), NodeError> {
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            // Iterate over all local variables
+            if let Node::Var {
+                scope: VarScope::Local { chip_id },
+                group,
+                offset,
+                field_type,
+            } = node
+            {
+                // Ensure we reference a valid group of variables for the chip id
+                if num_shared_vars
+                    .get(*chip_id)
+                    .and_then(|variable_groups| variable_groups.get(*group))
+                    .is_none_or(|variable_group_size| {
+                        Self::element_exceeds_width(*variable_group_size, *offset, *field_type)
+                    })
+                {
+                    return Err(NodeError::Variable(node_id));
                 }
-                Node::Periodic { column } => {
-                    counted_periodic_columns = cmp::max(counted_periodic_columns, column + 1);
-                    1
-                }
-                Node::Add { lhs_id, rhs_id } | Node::Sub { lhs_id, rhs_id } => {
-                    let lhs_degree = degrees.get(*lhs_id).ok_or(())?;
-                    let rhs_degree = degrees.get(*rhs_id).ok_or(())?;
-                    cmp::max(*lhs_degree, *rhs_degree)
-                }
-                Node::Mul { lhs_id, rhs_id } => {
-                    let lhs_degree = degrees.get(*lhs_id).ok_or(())?;
-                    let rhs_degree = degrees.get(*rhs_id).ok_or(())?;
-                    lhs_degree + rhs_degree
-                }
-            };
-            degrees.push(degree);
+            }
         }
 
-        Ok(Self {
-            nodes,
-            counted_local_variables,
-            counted_global_variables,
-            counted_periodic_columns,
-            trace_window_dimensions,
-            degrees,
-            _marker: PhantomData,
-        })
+        Ok(())
+    }
+
+    pub fn validate_local_variables(
+        &self,
+        num_local_variables: &VariableGroupInfo,
+    ) -> Result<(), NodeError> {
+        self.validate_shared_variables(slice::from_ref(&num_local_variables))
+    }
+
+    pub fn validate_global_variables(
+        &self,
+        num_variables: &VariableGroupInfo,
+    ) -> Result<(), NodeError> {
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            // Iterate over all local variables
+            if let Node::Var {
+                scope: VarScope::Global,
+                group,
+                offset,
+                field_type,
+            } = node
+            {
+                if num_variables.get(*group).is_none_or(|variable_group_size| {
+                    Self::element_exceeds_width(*variable_group_size, *offset, *field_type)
+                }) {
+                    return Err(NodeError::Variable(node_id));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_periodic(&self, num_periodic_columns: usize) -> Result<(), NodeError> {
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            if let Node::Periodic { column } = node {
+                if *column >= num_periodic_columns {
+                    return Err(NodeError::Periodic(node_id));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_degrees(&self) -> Vec<usize> {
+        let mut degrees = Vec::with_capacity(self.nodes.len());
+        for node in self.nodes {
+            degrees.push(match node {
+                Node::Constant(_) | Node::Var { .. } => 0,
+                Node::Trace { .. } | Node::Periodic { .. } => 1,
+                Node::Add { lhs_id, rhs_id } | Node::Sub { lhs_id, rhs_id } => {
+                    cmp::max(degrees[*lhs_id], degrees[*rhs_id])
+                }
+                Node::Mul { lhs_id, rhs_id } => degrees[*lhs_id] + degrees[*rhs_id],
+            })
+        }
+        degrees
+    }
+
+    pub fn get_dimension(&self, trace_widths: &[usize]) -> Result<Vec<Dimensions>, NodeError> {
+        let mut dims: Vec<_> = trace_widths
+            .iter()
+            .map(|&width| Dimensions { width, height: 0 })
+            .collect();
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            if let Node::Trace {
+                segment,
+                col_offset,
+                row_offset,
+                field_type,
+            } = node
+            {
+                if dims.get_mut(*segment).is_none_or(|dim| {
+                    // Set height
+                    dim.height = cmp::max(dim.height, row_offset + 1);
+                    Self::element_exceeds_width(dim.width, *col_offset, *field_type)
+                }) {
+                    return Err(NodeError::Trace(node_id));
+                }
+            }
+        }
+        Ok(dims)
+    }
+
+    fn element_exceeds_width(width: usize, offset: usize, field_type: FieldType) -> bool {
+        let element_width = match field_type {
+            FieldType::Base => 1,
+            FieldType::Ext => EF::D,
+        };
+        offset + element_width > width
     }
 }
 
 impl<F: Field> Node<F> {
     /// Given the evaluations of the preceding nodes, evaluates self over the extension field.
-    ///
     pub fn eval<EF: ExtensionField<F>>(
         &self,
         prev_evals: &[EF],
         global_variables: &[Vec<F>],
-        chip_variables: &[Vec<Vec<F>>],
+        local_variables: &[Vec<Vec<F>>],
         trace_evals: &[Vec<Vec<EF>>],
         periodic_evals: &[EF],
     ) -> EF {
@@ -177,11 +234,7 @@ impl<F: Field> Node<F> {
                 FieldType::Base => trace_evals[segment][row_offset][col_offset],
                 FieldType::Ext => {
                     let bases = &trace_evals[segment][row_offset][col_offset..col_offset + EF::D];
-                    bases
-                        .iter()
-                        .enumerate()
-                        .map(|(e_i, base_i)| EF::monomial(e_i) * *base_i)
-                        .sum()
+                    unflatten_extension(bases)
                 }
             },
             Self::Var {
@@ -192,7 +245,7 @@ impl<F: Field> Node<F> {
             } => {
                 let variables = match scope {
                     VarScope::Global => global_variables,
-                    VarScope::Local { chip_id } => &chip_variables[chip_id],
+                    VarScope::Local { chip_id } => &local_variables[chip_id],
                 };
                 let data = &variables[group];
                 match field_type {

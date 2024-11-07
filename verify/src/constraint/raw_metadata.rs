@@ -1,8 +1,7 @@
-use crate::constraint::node::{Node, ProcessedNodes};
+use crate::constraint::node::{Node, NodeError, NodesInfo};
 use crate::constraint::zerofier::ZerofierExpression;
 use crate::constraint::{ChipMetadata, Expression, MachineMetadata};
 use p3_field::{ExtensionField, Field};
-use std::iter::zip;
 use std::marker::PhantomData;
 
 pub struct RawMachineMetadata<F: Field> {
@@ -14,15 +13,21 @@ pub struct RawMachineMetadata<F: Field> {
 
 pub struct RawChipMetadata<F: Field> {
     num_local_variables: Vec<usize>,
-    trace_widths_base: Vec<usize>,
+    trace_widths: Vec<usize>,
     zerofiers: Vec<ZerofierExpression<F>>,
     periodic: Vec<Vec<F>>,
     nodes: Vec<Node<F>>,
     constraints: Vec<Expression>,
 }
 
+pub enum MachineError {
+    Chip(usize, ChipError),
+    Nodes(NodeError),
+    Constraint(usize),
+}
+
 impl<F: Field, EF: ExtensionField<F>> TryFrom<RawMachineMetadata<F>> for MachineMetadata<F, EF> {
-    type Error = ();
+    type Error = MachineError;
 
     fn try_from(value: RawMachineMetadata<F>) -> Result<Self, Self::Error> {
         let RawMachineMetadata {
@@ -31,40 +36,52 @@ impl<F: Field, EF: ExtensionField<F>> TryFrom<RawMachineMetadata<F>> for Machine
             nodes,
             constraints,
         } = value;
+
+        let machine_nodes_info = NodesInfo::<F, EF>::new(&nodes).map_err(MachineError::Nodes)?;
+
+        // No periodic columns
+        machine_nodes_info
+            .validate_periodic(0)
+            .map_err(MachineError::Nodes)?;
+
+        // No trace
+        machine_nodes_info
+            .get_dimension(&[])
+            .map_err(MachineError::Nodes)?;
+
+        // Check correct global variables
+        machine_nodes_info
+            .validate_global_variables(&num_global_variables)
+            .map_err(MachineError::Nodes)?;
+
         let chips = chips
             .into_iter()
-            .map(ChipMetadata::try_from)
+            .enumerate()
+            .map(|(chip_id, chip)| {
+                let chip: ChipMetadata<F, EF> = chip
+                    .try_into()
+                    .map_err(|err| MachineError::Chip(chip_id, err))?;
+
+                // ensure the chip's constraints reference valid global variables
+                let chip_nodes_info = chip.node_info();
+                chip_nodes_info
+                    .validate_global_variables(&num_global_variables)
+                    .map_err(|err| MachineError::Chip(chip_id, ChipError::NodeError(err)))?;
+
+                Ok(chip)
+            })
             .collect::<Result<Vec<ChipMetadata<F, EF>>, _>>()?;
 
-        let ProcessedNodes::<F, EF> {
-            nodes,
-            counted_local_variables,
-            counted_global_variables,
-            counted_periodic_columns,
-            trace_window_dimensions,
-            ..
-        } = nodes.try_into()?;
+        // Local variable access specific chips
+        let shared_variables: Vec<_> = chips.iter().map(|chip| &chip.num_local_variables).collect();
+        machine_nodes_info
+            .validate_shared_variables(&shared_variables)
+            .map_err(MachineError::Nodes)?;
 
-        if counted_local_variables.len() >= chips.len() {
-            return Err(());
-        }
-
-        if counted_periodic_columns != 0 {
-            return Err(());
-        }
-        if !trace_window_dimensions.is_empty() {
-            return Err(());
-        }
-
-        size_vec_is_subset(&num_global_variables, &counted_global_variables)?;
-        for (chip, counted_local_vars) in zip(&chips, counted_local_variables) {
-            size_vec_is_subset(&num_global_variables, &chip.num_global_variables)?;
-            size_vec_is_subset(&chip.num_local_variables, &counted_local_vars)?;
-        }
-
-        for constraint in &constraints {
-            if constraint.node_id >= nodes.len() || constraint.zerofier_id.is_none() {
-                return Err(());
+        // For each constraint, ensure it references a valid node and it contains no zerofier
+        for (constraint_idx, constraint) in constraints.iter().enumerate() {
+            if constraint.node_id >= nodes.len() || constraint.zerofier_id.is_some() {
+                return Err(MachineError::Constraint(constraint_idx));
             }
         }
 
@@ -77,65 +94,64 @@ impl<F: Field, EF: ExtensionField<F>> TryFrom<RawMachineMetadata<F>> for Machine
     }
 }
 
+pub enum ChipError {
+    NodeError(NodeError),
+    Periodic(usize),
+    Constraint(usize),
+}
+
 impl<F: Field, EF: ExtensionField<F>> TryFrom<RawChipMetadata<F>> for ChipMetadata<F, EF> {
-    type Error = ();
+    type Error = ChipError;
 
     fn try_from(value: RawChipMetadata<F>) -> Result<Self, Self::Error> {
         let RawChipMetadata {
             num_local_variables,
-            trace_widths_base: trace_widths,
+            trace_widths,
             zerofiers,
             periodic,
             nodes,
             constraints,
         } = value;
-        let ProcessedNodes::<F, EF> {
-            nodes,
-            counted_local_variables,
-            counted_global_variables,
-            counted_periodic_columns,
-            trace_window_dimensions,
-            degrees,
-            ..
-        } = nodes.try_into()?;
+        let nodes_info = NodesInfo::<F, EF>::new(&nodes).map_err(ChipError::NodeError)?;
 
-        if counted_local_variables.len() != 1 {
-            return Err(());
-        }
-        size_vec_is_subset(&num_local_variables, &counted_local_variables[0])?;
+        // Ensure the nodes only reference local variables with `chip_id = 0` and that these
+        // are a subset of the predefined number of variables
+        nodes_info
+            .validate_local_variables(&num_local_variables)
+            .map_err(ChipError::NodeError)?;
 
-        if trace_widths.len() != trace_window_dimensions.len() {
-            return Err(());
-        }
-        if zip(trace_widths, &trace_window_dimensions)
-            .any(|(expected_width, dim)| expected_width != dim.width)
-        {
-            return Err(());
-        }
+        // Ensure nodes reference trace elements in the correct range
+        let trace_window_dimensions = nodes_info
+            .get_dimension(&trace_widths)
+            .map_err(ChipError::NodeError)?;
 
-        if periodic.len() != counted_periodic_columns {
-            return Err(());
-        }
-        for periodic_column in &periodic {
-            if !periodic_column.len().is_power_of_two() {
-                return Err(());
+        // Ensure correct access to periodic columns and their sizes are powers of two
+        nodes_info
+            .validate_periodic(periodic.len())
+            .map_err(ChipError::NodeError)?;
+
+        // Ensure periodic columns are power of 2
+        for (col_idx, col) in periodic.iter().enumerate() {
+            if !col.len().is_power_of_two() {
+                return Err(ChipError::Periodic(col_idx));
             }
         }
 
-        for constraint in &constraints {
-            if constraint.node_id >= nodes.len() {
-                return Err(());
+        // Ensure each constraint has a zerofier and that it references valid nodes and zerofiers.
+        for (constraint_idx, constraint) in constraints.iter().enumerate() {
+            if constraint.node_id >= nodes.len()
+                || constraint
+                    .zerofier_id
+                    .is_some_and(|id| id >= zerofiers.len())
+            {
+                return Err(ChipError::Constraint(constraint_idx));
             }
-
-            constraint
-                .zerofier_id
-                .and_then(|zerofier_id| zerofiers.get(zerofier_id))
-                .ok_or(())?;
         }
+
+        let degrees = nodes_info.get_degrees();
 
         Ok(Self {
             num_local_variables,
-            num_global_variables: counted_global_variables,
             trace_window_dimensions,
             periodic,
             zerofiers,
@@ -145,16 +161,4 @@ impl<F: Field, EF: ExtensionField<F>> TryFrom<RawChipMetadata<F>> for ChipMetada
             _marker: PhantomData,
         })
     }
-}
-
-fn size_vec_is_subset(big: &[usize], small: &[usize]) -> Result<(), ()> {
-    if big.len() < small.len() {
-        return Err(());
-    }
-
-    if zip(big, small).any(|(big_count, small_count)| big_count < small_count) {
-        return Err(());
-    }
-
-    Ok(())
 }
