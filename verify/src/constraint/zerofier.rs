@@ -1,6 +1,6 @@
 use p3_field::{ExtensionField, Field};
 
-pub enum ZerofierExpression<F> {
+pub(super) enum ZerofierExpression<F> {
     Constant(F),
     X(Exponent),
     G(Exponent),
@@ -11,20 +11,21 @@ pub enum ZerofierExpression<F> {
 }
 
 impl<F: Field> ZerofierExpression<F> {
-    pub fn eval<EF: ExtensionField<F>>(&self, x: EF, g: F, n: usize) -> EF {
-        match self {
+    pub fn eval<EF: ExtensionField<F>>(&self, x: EF, g: F, n: usize) -> Option<EF> {
+        let eval = match self {
             Self::Constant(c) => (*c).into(),
             Self::X(exp) => x.exp_u64(exp.power(n) as u64),
             Self::G(exp) => x.exp_u64(exp.power(n) as u64),
-            Self::Add(lhs, rhs) => lhs.eval(x, g, n) + rhs.eval(x, g, n),
-            Self::Sub(lhs, rhs) => lhs.eval(x, g, n) - rhs.eval(x, g, n),
-            Self::Mul(lhs, rhs) => lhs.eval(x, g, n) * rhs.eval(x, g, n),
-            Self::Div(lhs, rhs) => lhs.eval(x, g, n) / rhs.eval(x, g, n),
-        }
+            Self::Add(lhs, rhs) => lhs.eval(x, g, n)? + rhs.eval(x, g, n)?,
+            Self::Sub(lhs, rhs) => lhs.eval(x, g, n)? - rhs.eval(x, g, n)?,
+            Self::Mul(lhs, rhs) => lhs.eval(x, g, n)? * rhs.eval(x, g, n)?,
+            Self::Div(lhs, rhs) => lhs.eval(x, g, n)? * rhs.eval(x, g, n)?.try_inverse()?,
+        };
+        Some(eval)
     }
 }
 
-enum Exponent {
+pub(super) enum Exponent {
     /// a^i
     First(usize),
     /// a^{n-i}

@@ -1,21 +1,73 @@
-use crate::constraint::node::{Node, NodesInfo};
+use crate::constraint::node::NodesInfo;
 use crate::constraint::zerofier::ZerofierExpression;
-use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_field::{ExtensionField, Field};
 use p3_matrix::Dimensions;
-use std::iter::zip;
 use std::marker::PhantomData;
-use std::slice;
 
-pub mod node;
-mod raw_metadata;
-pub mod zerofier;
+mod chip;
+mod chip_metadata;
+mod machine_metadata;
+mod node;
+mod zerofier;
 
-pub type VariableGroupInfo = Vec<usize>;
+#[derive(Copy, Clone, Debug)]
+enum Node<F: Field> {
+    Constant(F),
+    /// Base or extension field element from a list of local traces
+    Trace {
+        segment: usize,
+        col_offset: usize,
+        row_offset: usize,
+        field_type: FieldType,
+    },
+    /// Base or extension field element local from global (e.g. public values or challenges) or
+    /// local (permutation argument hints) variable.
+    Var {
+        scope: VarScope,
+        group: usize,
+        offset: usize,
+        field_type: FieldType,
+    },
+    /// Base field elements from local periodic columns
+    Periodic {
+        column: usize,
+    },
+    Add {
+        lhs_id: usize,
+        rhs_id: usize,
+    },
+    Sub {
+        lhs_id: usize,
+        rhs_id: usize,
+    },
+    Mul {
+        lhs_id: usize,
+        rhs_id: usize,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VarScope {
+    /// Refer to a shared variable (public value, challenge, ...)
+    Global,
+    /// Refer to a local variable (permutation hint, ...)
+    /// When evaluating a trace, `chip_id` must be 0 to refer to itself
+    Local { chip_id: usize },
+}
+
+#[derive(Copy, Clone, Debug)]
+enum FieldType {
+    Base,
+    Ext,
+}
 
 struct Expression {
     node_id: usize,
     zerofier_id: Option<usize>,
 }
+
+type VariableGroupInfo = Vec<usize>;
+type PeriodicColumn<F> = Vec<F>;
 
 pub struct MachineMetadata<F: Field, EF: ExtensionField<F>> {
     num_global_variables: VariableGroupInfo,
@@ -27,7 +79,7 @@ pub struct MachineMetadata<F: Field, EF: ExtensionField<F>> {
 pub struct ChipMetadata<F: Field, EF: ExtensionField<F>> {
     num_local_variables: VariableGroupInfo,
     trace_window_dimensions: Vec<Dimensions>,
-    periodic: Vec<Vec<F>>,
+    periodic: Vec<PeriodicColumn<F>>,
     zerofiers: Vec<ZerofierExpression<F>>,
     nodes: Vec<Node<F>>,
     constraints: Vec<Expression>,
@@ -66,114 +118,6 @@ pub struct ChipData<'a, F: Field, EF: ExtensionField<F>> {
     trace_evals: Vec<Vec<Vec<EF>>>,
     quotient_evals: Vec<EF>,
     log_height: usize,
-}
-
-impl<'a, F: Field, EF: ExtensionField<F>> ChipData<'a, F, EF> {
-    fn new(
-        chip: &'a ChipMetadata<F, EF>,
-        local_variables: Vec<Vec<F>>,
-        trace_evals: Vec<Vec<Vec<EF>>>,
-        quotient_evals: Vec<EF>,
-        log_height: usize,
-    ) -> Result<Self, ()> {
-        // Check length of local variables
-        if zip(&chip.num_local_variables, &local_variables).any(|(size, vars)| vars.len() != *size)
-        {
-            return Err(());
-        }
-
-        // Check trace dimensions
-        if chip.trace_window_dimensions.len() != trace_evals.len() {
-            return Err(());
-        }
-
-        // Check size of trace evaluations
-        for (dim, segment_rows) in zip(&chip.trace_window_dimensions, &trace_evals) {
-            if segment_rows.len() != dim.height {
-                return Err(());
-            }
-            if segment_rows.iter().any(|row| row.len() != dim.width) {
-                return Err(());
-            }
-        }
-
-        //
-        let num_quotient_evals = chip.num_quotient_evals();
-        if quotient_evals.len() != num_quotient_evals * EF::D {
-            return Err(());
-        }
-
-        Ok(Self {
-            chip,
-            local_variables,
-            trace_evals,
-            quotient_evals,
-            log_height,
-        })
-    }
-
-    pub fn check_quotient(&self, global_variables: &[Vec<F>], zeta: EF, alpha: EF) -> Result<(), ()>
-    where
-        F: TwoAdicField,
-    {
-        let log_n = self.log_height;
-        let n = 1 << log_n;
-        let g = F::two_adic_generator(log_n);
-        let periodic_evals: Vec<EF> = self
-            .chip
-            .periodic
-            .iter()
-            .map(|_col| {
-                // todo!()
-                EF::zero()
-            })
-            .collect();
-
-        let mut evals: Vec<EF> = Vec::with_capacity(self.chip.nodes.len());
-        for node in &self.chip.nodes {
-            evals.push(node.eval(
-                &evals,
-                global_variables,
-                slice::from_ref(&self.local_variables),
-                &self.trace_evals,
-                &periodic_evals,
-            ));
-        }
-
-        let inverse_zerofier_evals: Vec<EF> = self
-            .chip
-            .zerofiers
-            .iter()
-            .map(|zerofier| zerofier.eval(zeta, g, n).try_inverse())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(())?;
-
-        let quotient = self
-            .chip
-            .constraints
-            .iter()
-            .rev()
-            .fold(EF::zero(), |acc, constraint| {
-                let eval = evals[constraint.node_id]
-                    * inverse_zerofier_evals[constraint.zerofier_id.unwrap()];
-                acc * alpha + eval
-            });
-
-        // eval q(z) = ∑ q_i(z) * z^{ni}
-        let zeta_pow_n = zeta.exp_power_of_2(log_n);
-        let quotient_expected = self
-            .quotient_evals
-            .chunks_exact(EF::D)
-            .map(unflatten_extension)
-            .rev()
-            .fold(EF::zero(), |acc, eval| acc * zeta_pow_n + eval);
-
-        if quotient != quotient_expected {
-            return Err(());
-        }
-
-        Ok(())
-    }
 }
 
 fn unflatten_extension<F: Field, EF: ExtensionField<F>>(bases: &[EF]) -> EF {
